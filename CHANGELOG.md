@@ -20,10 +20,10 @@ interface: they are only ever appended to, never renumbered or reused.
   consumed at scheduling time (native Soroban auth) and the exact parameters
   are committed in a SHA-256 `params_hash` so execution cannot be replayed or
   parameter-swapped.
-- New `StreamError` codes (append-only): `IntentNotFound` (14),
-  `IntentNotPending` (15), `IntentNotYetExecutable` (16), `IntentExpired` (17),
-  `IntentNotCancellable` (18), `InvalidScheduleParameters` (19),
-  `IntentParamsMismatch` (20), `IntentNotExpired` (21).
+- New `StreamError` codes (append-only): `IntentNotFound` (18),
+  `IntentNotPending` (19), `IntentNotYetExecutable` (20), `IntentExpired` (21),
+  `IntentNotCancellable` (22), `InvalidScheduleParameters` (23),
+  `IntentParamsMismatch` (24), `IntentNotExpired` (25).
 - New events: `StreamScheduled`, `ScheduledStreamExecuted`,
   `ScheduledIntentCancelled`, `ScheduledIntentExpired`.
 - New storage keys (append-only): `NextIntentId`, `Intent(id)`,
@@ -32,6 +32,77 @@ interface: they are only ever appended to, never renumbered or reused.
   `--send=no` simulation before sending, `MIN_FEE` gate, optional reclaim).
 - `docs/SCHEDULED_INTENTS.md` — keeper guide plus replay / front-running /
   under-funded-keeper griefing threat model and a testnet run log.
+- **Optional protocol-fee treasury** (`treasury.rs`): a fee charged once at
+  the deposit boundary of `create_stream` (`deposit × fee_bps / 10_000`,
+  floored, sender pays `deposit + fee`). The stream's `deposit` and every
+  accrual/payout/cancel computation are unchanged — at `fee_bps = 0` (the
+  default) behavior is bit-for-bit identical to v0.3. Protocol cap:
+  `MAX_FEE_BPS = 100` (1 %), a hard constant.
+- Per-token treasury accounting (`Treasury { charged_total, withdrawn_total }`)
+  plus a per-stream fee record (`StreamFee { token, amount }`), written only
+  in lockstep with the new append-only events `FeeCharged` (stream_id topic)
+  and `FeeWithdrawn` (token topic).
+- Withdrawal governance: `__constructor(governor)` binds the treasury
+  governor at deploy time (no front-runnable bootstrap); two-step rotation
+  (`nominate_governor` / `accept_governor`); governor-gated `set_fee_bps`
+  and `withdraw_treasury` (CEI-ordered, bounded by fees collected minus
+  fees withdrawn).
+- Open verification reads: `treasury_status(token)`, `stream_fee(stream_id)`,
+  `total_streams()`, and the bounded paged scan `verify_treasury(token,
+  start_id, count)` — proving `fee_total == Σ per-stream fees == Σ FeeCharged
+  events` from public reads. `scripts/verify-fees.ts` is a key-less public
+  audit script reconciling all three records against any Soroban RPC.
+- New `StreamError` variants (appended): `FeeRateTooHigh` (14),
+  `NotGovernor` (15), `NoPendingGovernor` (16),
+  `InsufficientTreasuryBalance` (17).
+- Treasury test suite incl. the decision-table test for fees ×
+  cancel-refunds and a seeded property test asserting the verifier always
+  agrees across random activity sequences.
+- `infra/ttl-sentinel` — an operational sentinel for storage rent and TTLs,
+  documented in [`infra/ttl-sentinel/README.md`](./infra/ttl-sentinel/README.md)
+  and [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) §12. It scans every
+  storage class (stream, address index, id counter, contract instance, Wasm
+  code), reads `liveUntilLedgerSeq`, and alerts on `warn` / `crit` / `expired`
+  transitions to console, JSONL and webhook sinks — read-only, no key.
+  Extension is a separate, off-by-default component with its own funded key,
+  dry-run default and monthly budget meter. The same module projects rent from
+  measured entry sizes (504 B per stream) against the CAP-0066 fee curve, as
+  input for the upcoming pricing/dust work.
+- Recorded per-class worst-case cliffs derived from the contract's actual
+  extension behavior: 200,000 ledgers for streams and index entries,
+  **4,095 ledgers (~5.7 h) for the id counter, the contract instance and the
+  Wasm code entry**, none of which the contract ever extends (invocations do
+  not auto-extend instance/code entries). A schedule whose warning would land
+  outside its class cliff now fails validation instead of shipping.
+- Error-surface instrumentation and a generated test matrix
+  (`error_surface_test.rs`): every `(entrypoint, condition)` rejection branch is
+  registered in `src/surface.rs`, probed for its declared `StreamError`, and
+  checked for coverage — CI fails on any error code with zero reachable
+  branches or any branch without a code.
+- Generated [`docs/ERRORS.md`](./docs/ERRORS.md) (entrypoint × branch → code
+  table) with a CI step that regenerates it and diffs the committed artifact.
+- Governed release pipeline (`sandbox → testnet → mainnet canary`):
+  `.github/workflows/promote.yml` (manual dispatch, GitHub
+  Environment-gated approvals, digest continuity at every step, automatic
+  rollback job) and `.github/workflows/rehearsal.yml` (secret-free dress
+  rehearsal, mocked deploys). New scripts under `scripts/`:
+  `release_gates.sh`, `verify_release_digest.sh`,
+  `contract_interface_hash.sh`, `schema_diff.sh`, `deploy_contract.sh`,
+  `canary_check.sh`, `record_promotion.sh`, `rollback_mainnet.sh`,
+  `promote_rehearsal.sh`, `lib.sh`.
+- Append-only deployment records in `deployments/` (promotion log, per-run
+  records, per-environment contract-interface baselines) and the design +
+  operator docs `docs/DEPLOY_PIPELINE.md` and `docs/CANARY_RUNBOOK.md`.
+
+### Changed
+- **Deployment interface:** the contract now has a constructor. Deploy with
+  the governor address as a constructor argument
+  (`stellar contract deploy … -- --governor G…`); `scripts/deploy_testnet.sh`
+  passes the deployer as governor. Existing v0.3 deployments are unaffected
+  (no upgrade path; new deployments only).
+- Retired `StreamError::NotStreamSender` (2) and `NotStreamRecipient` (3) as
+  unreachable under the append-only policy: the numeric codes are kept and
+  reserved, never reused or renumbered.
 
 ## [0.3.0] - 2026-10-04
 

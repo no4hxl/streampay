@@ -10,7 +10,7 @@
 
 use soroban_sdk::{contractclient, Address, Env, Vec};
 
-use crate::{ScheduledIntent, Stream, StreamError};
+use crate::{FeeScan, ScheduledIntent, Stream, StreamError, TreasuryStatus};
 
 /// Interface of the StreamPay streaming-payments contract.
 #[contractclient(name = "StreamingPaymentsClient")]
@@ -58,4 +58,24 @@ pub trait StreamingPaymentsApi {
     fn reclaim_expired(env: Env, intent_id: u64) -> Result<(), StreamError>;
     fn get_intent(env: Env, intent_id: u64) -> Result<ScheduledIntent, StreamError>;
     fn sender_intents(env: Env, sender: Address, offset: u32, limit: u32) -> Vec<u64>;
+
+    // --- treasury ---
+    fn set_fee_bps(env: Env, caller: Address, new_fee_bps: u32) -> Result<(), StreamError>;
+    fn nominate_governor(
+        env: Env,
+        caller: Address,
+        new_governor: Address,
+    ) -> Result<(), StreamError>;
+    fn accept_governor(env: Env, caller: Address) -> Result<(), StreamError>;
+    fn withdraw_treasury(
+        env: Env,
+        caller: Address,
+        token: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), StreamError>;
+    fn treasury_status(env: Env, token: Address) -> TreasuryStatus;
+    fn stream_fee(env: Env, stream_id: u64) -> Result<i128, StreamError>;
+    fn verify_treasury(env: Env, token: Address, start_id: u64, count: u32) -> FeeScan;
+    fn total_streams(env: Env) -> u64;
 }

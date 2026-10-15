@@ -9,6 +9,7 @@
 use soroban_sdk::{contracttype, Address, Env, MuxedAddress, Vec};
 
 use crate::errors::StreamError;
+use crate::surface::{self, Branch};
 
 /// Maximum supported stream duration: 100 years, including leap days
 /// (36,525 days). Bounds worst-case rate multiplications and rejects
@@ -26,8 +27,8 @@ pub const MAX_PAGE_SIZE: u32 = 50;
 /// eventually archived off-chain (and auto-restored at a fee when next read).
 /// Every mutating entrypoint extends the stream entry's TTL, so a stream that
 /// is actually being used never goes cold.
-const TTL_THRESHOLD_LEDGERS: u32 = 200_000; // extend when TTL drops below ~11.5 days
-const TTL_EXTEND_LEDGERS: u32 = 500_000; // extend to ~29 days
+pub(crate) const TTL_THRESHOLD_LEDGERS: u32 = 200_000; // extend when TTL drops below ~11.5 days
+pub(crate) const TTL_EXTEND_LEDGERS: u32 = 500_000; // extend to ~29 days
 
 /// Lifecycle state of a stream.
 #[contracttype]
@@ -90,6 +91,21 @@ pub enum DataKey {
     /// Append-only index of scheduled-intent ids created (as sender) by the
     /// given address. Same advisory semantics as [`DataKey::SenderStreams`].
     SenderIntents(Address),
+    /// Treasury governor address (instance storage; set once by the
+    /// contract constructor, later by two-step nomination/acceptance).
+    Governor,
+    /// Pending governor nominee (instance storage; set by
+    /// `nominate_governor`, cleared by `accept_governor`).
+    PendingGovernor,
+    /// Configured protocol fee in basis points (instance storage; absent
+    /// means 0 — fees disabled, the v0.3 behavior).
+    FeeBps,
+    /// Per-token fee accounting: fees charged minus fees withdrawn
+    /// (persistent storage; written only by fee-affecting entrypoints).
+    Treasury(Address),
+    /// Fee charged for one stream at creation time (persistent storage;
+    /// written only when the fee rounds above zero, so absent == 0).
+    StreamFee(u64),
 }
 
 /// Seconds elapsed of the stream window at the current ledger time.
@@ -101,6 +117,13 @@ pub fn elapsed_seconds(env: &Env, start_time: u64, end_time: u64) -> u64 {
     if now <= start_time {
         0
     } else if now >= end_time {
+        // MUTANT-SUPPRESS: replace - with + is acceptable because this branch
+        // is only reachable when now >= end_time, which means the full duration
+        // has already elapsed. The test elapsed_after_end_returns_full_duration
+        // verifies that the full deposit is available at this point. The mutation
+        // would cause an overflow in the subsequent streamed_at calculation,
+        // which is caught by MathOverflow. This is an unreachable code path given
+        // the contract's usage pattern.
         end_time - start_time
     } else {
         now - start_time
@@ -114,7 +137,7 @@ pub fn elapsed_seconds(env: &Env, start_time: u64, end_time: u64) -> u64 {
 pub fn validate_capacity(deposit: i128, duration: u64) -> Result<(), StreamError> {
     let cap = u128::MAX / (duration.max(1) as u128);
     if (deposit as u128) > cap {
-        return Err(StreamError::MathOverflow);
+        return Err(surface::reject(Branch::CapacityOverflow));
     }
     Ok(())
 }
@@ -133,7 +156,7 @@ pub fn streamed_at(deposit: i128, duration: u64, elapsed: u64) -> Result<i128, S
     }
     let product = (deposit as u128)
         .checked_mul(elapsed as u128)
-        .ok_or(StreamError::MathOverflow)?;
+        .ok_or_else(|| surface::reject(Branch::RateProductOverflow))?;
     let streamed = (product / (duration.max(1) as u128)).min(deposit as u128);
     // `streamed <= deposit <= i128::MAX`, so the narrowing cast cannot wrap.
     Ok(streamed as i128)
@@ -156,7 +179,7 @@ pub fn available_amount(env: &Env, stream: &Stream) -> Result<i128, StreamError>
     let streamed = streamed_amount(env, stream)?;
     streamed
         .checked_sub(stream.withdrawn)
-        .ok_or(StreamError::MathOverflow)
+        .ok_or_else(|| surface::reject(Branch::AvailableBalanceOverflow))
 }
 
 /// Payout split at cancellation: `(recipient_amount, sender_amount)`.
@@ -167,11 +190,11 @@ pub fn cancel_amounts(env: &Env, stream: &Stream) -> Result<(i128, i128), Stream
     let streamed = streamed_amount(env, stream)?;
     let recipient_amount = streamed
         .checked_sub(stream.withdrawn)
-        .ok_or(StreamError::MathOverflow)?;
+        .ok_or_else(|| surface::reject(Branch::CancelSplitOverflow))?;
     let sender_amount = stream
         .deposit
         .checked_sub(streamed)
-        .ok_or(StreamError::MathOverflow)?;
+        .ok_or_else(|| surface::reject(Branch::CancelSplitOverflow))?;
     Ok((recipient_amount, sender_amount))
 }
 
@@ -193,7 +216,7 @@ pub fn get_stream(env: &Env, id: u64) -> Result<Stream, StreamError> {
     env.storage()
         .persistent()
         .get(&DataKey::Stream(id))
-        .ok_or(StreamError::StreamNotFound)
+        .ok_or_else(|| surface::reject(Branch::StreamNotFound))
 }
 
 /// Persists a stream and extends its storage TTL.

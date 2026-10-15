@@ -46,7 +46,8 @@ impl Fixture {
         let keeper = Address::generate(&env);
         StellarAssetClient::new(&env, &token).mint(&sender, &(1_000 * DEPOSIT));
 
-        let contract_id = env.register(StreamingPayments, ());
+        let governor = Address::generate(&env);
+        let contract_id = env.register(StreamingPayments, (governor,));
         let client = Client::new(&env, &contract_id);
         StellarAssetClient::new(&env, &token).approve(
             &sender,
