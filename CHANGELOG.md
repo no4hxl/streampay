@@ -9,6 +9,30 @@ interface: they are only ever appended to, never renumbered or reused.
 
 ## [Unreleased]
 
+### Added
+- Scheduled stream intents: `schedule_stream` pre-authorizes one or more
+  future stream creations (one-shot or recurring "cron") and escrows
+  `(deposit + fee_budget) × occurrences` up front; `execute_scheduled`
+  permissionlessly materializes each occurrence and pays the keeper the
+  escrowed fee; `cancel_scheduled` (sender, before the window) and
+  `reclaim_expired` (anyone, after `expires_at`) refund outstanding escrow;
+  `get_intent` / `sender_intents` provide read access. Sender authorization is
+  consumed at scheduling time (native Soroban auth) and the exact parameters
+  are committed in a SHA-256 `params_hash` so execution cannot be replayed or
+  parameter-swapped.
+- New `StreamError` codes (append-only): `IntentNotFound` (14),
+  `IntentNotPending` (15), `IntentNotYetExecutable` (16), `IntentExpired` (17),
+  `IntentNotCancellable` (18), `InvalidScheduleParameters` (19),
+  `IntentParamsMismatch` (20), `IntentNotExpired` (21).
+- New events: `StreamScheduled`, `ScheduledStreamExecuted`,
+  `ScheduledIntentCancelled`, `ScheduledIntentExpired`.
+- New storage keys (append-only): `NextIntentId`, `Intent(id)`,
+  `SenderIntents(addr)`.
+- `scripts/keeper.sh` — reference keeper (explicit ids or sender discovery,
+  `--send=no` simulation before sending, `MIN_FEE` gate, optional reclaim).
+- `docs/SCHEDULED_INTENTS.md` — keeper guide plus replay / front-running /
+  under-funded-keeper griefing threat model and a testnet run log.
+
 ## [0.3.0] - 2026-10-04
 
 ### Changed

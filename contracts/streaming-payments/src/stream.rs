@@ -83,6 +83,13 @@ pub enum DataKey {
     /// Append-only index of stream ids created (as sender) by the given
     /// address. Same advisory semantics as [`DataKey::RecipientStreams`].
     SenderStreams(Address),
+    /// Next scheduled-intent id to hand out; ids start at 1.
+    NextIntentId,
+    /// The scheduled intent with the given id.
+    Intent(u64),
+    /// Append-only index of scheduled-intent ids created (as sender) by the
+    /// given address. Same advisory semantics as [`DataKey::SenderStreams`].
+    SenderIntents(Address),
 }
 
 /// Seconds elapsed of the stream window at the current ledger time.
@@ -216,7 +223,7 @@ pub fn index_stream(env: &Env, stream: &Stream) {
     );
 }
 
-fn push_to_index(env: &Env, key: &DataKey, id: u64) {
+pub(crate) fn push_to_index(env: &Env, key: &DataKey, id: u64) {
     let mut ids: Vec<u64> = env
         .storage()
         .persistent()

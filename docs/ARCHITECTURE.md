@@ -12,11 +12,15 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 │                                                                    │
 │  lib.rs      entrypoints: create_stream / withdraw / withdraw_max / │
 │              cancel_stream / top_up / get_stream / available /      │
-│              recipient_streams / sender_streams                    │
+│              recipient_streams / sender_streams / schedule_stream / │
+│              execute_scheduled / cancel_scheduled / reclaim_expired │
 │  stream.rs   Stream type, storage, checked accrual math            │
+│  schedule.rs ScheduledIntent type, validation, timing, escrow      │
 │  errors.rs   StreamError — stable numeric codes, append-only       │
 │  events.rs   StreamCreated / Withdrawn / StreamCancelled /         │
-│              StreamToppedUp (stream_id as topic)                   │
+│              StreamToppedUp / StreamScheduled /                    │
+│              ScheduledStreamExecuted / ScheduledIntentCancelled /  │
+│              ScheduledIntentExpired                                │
 └──────────────────────────┬─────────────────────────────────────────┘
                            │ token interface (SAC-compatible)
                            ▼
@@ -31,6 +35,9 @@ reentrancy, TTL strategy, and the design decisions behind the v1 API. Read the
 | `DataKey::Stream(id)` | `Stream` | full per-stream state |
 | `DataKey::RecipientStreams(addr)` | `Vec<u64>` | append-only ids where `addr` receives |
 | `DataKey::SenderStreams(addr)` | `Vec<u64>` | append-only ids created by `addr` |
+| `DataKey::NextIntentId` | `u64` | monotonic scheduled-intent id counter |
+| `DataKey::Intent(id)` | `ScheduledIntent` | full per-intent state (escrow, timing, `params_hash`) |
+| `DataKey::SenderIntents(addr)` | `Vec<u64>` | append-only intent ids scheduled by `addr` |
 
 Streams live in **persistent** storage. Every mutating entrypoint that touches
 a stream extends its TTL (`TTL_THRESHOLD_LEDGERS = 200_000`, extend to
@@ -38,7 +45,8 @@ a stream extends its TTL (`TTL_THRESHOLD_LEDGERS = 200_000`, extend to
 abandoned streams naturally archive to off-chain recovery — the Soroban-native
 way to bound state bloat without penalizing active users. Index entries get
 the same TTL treatment on write *and* on read, so an actively-queried address
-stays hot.
+stays hot. Scheduled intents reuse the same persistent-storage + TTL regime
+(`schedule.rs`), so an unfunded intents registry is bounded the same way.
 
 There is still **no global registry** of all streams (no contract-wide
 `Vec<u64>`): that would make `create_stream` cost grow with total stream count.
@@ -94,6 +102,10 @@ nothing has accrued, at `now ≥ end_time` the full duration has elapsed.
 | `withdraw` | recipient only | recipient |
 | `cancel_stream` | sender always; recipient iff `cancelable` | caller |
 | `top_up` | sender only | sender |
+| `schedule_stream` | anyone; `sender` must authorize | sender |
+| `execute_scheduled` | anyone (keeper) | keeper (the caller) |
+| `cancel_scheduled` | intent sender, before the window opens | sender |
+| `reclaim_expired` | anyone, after `expires_at` | none |
 
 The `cancelable` flag is chosen per stream at creation: payroll senders often
 want sender-only cancellation, while vesting recipients may want the right to
@@ -116,6 +128,12 @@ happen **before** the token transfers:
 - `create_stream` / `top_up`: pull tokens first, persist after — if a
   reentrant callback abused the transfer-in, the persisted state still
   reconciles with the balance (invariant below).
+- `schedule_stream`: validates, commits `params_hash`, persists the intent,
+  emits, *then* pulls the escrow. A failed transfer rolls the invocation back.
+- `execute_scheduled`: decrements `occurrences_remaining` (terminal when it hits
+  zero), persists, creates the stream, emits, *then* pays the keeper. A
+  reentrant token callback finds the occurrence already consumed.
+- `cancel_scheduled` / `reclaim_expired`: mark terminal, refund, then emit.
 
 Additionally, `withdraw` and `cancel_stream` re-read `status` after auth: a
 malicious token contract that reenters `withdraw` during its own transfer
@@ -169,6 +187,14 @@ the public interface:
 | 11 | `MathOverflow` | a checked computation would overflow |
 | 12 | `NotAuthorized` | caller is neither sender nor (cancelable) recipient |
 | 13 | `NothingToWithdraw` | `withdraw_max` with an empty accrued balance |
+| 14 | `IntentNotFound` | no scheduled intent with this id |
+| 15 | `IntentNotPending` | intent already executed / cancelled / expired |
+| 16 | `IntentNotYetExecutable` | before the occurrence's `due` time |
+| 17 | `IntentExpired` | `now ≥ expires_at` on execute/cancel |
+| 18 | `IntentNotCancellable` | cancel after the execution window opened |
+| 19 | `InvalidScheduleParameters` | bad interval/occurrences/`execute_after`/`expires_at` |
+| 20 | `IntentParamsMismatch` | stored params no longer match `params_hash` |
+| 21 | `IntentNotExpired` | `reclaim_expired` before `expires_at` |
 
 Codes are **append-only**: never renumber or reuse a variant.
 
@@ -202,6 +228,20 @@ entry itself.
 Simplicity is a security feature; richer flows belong in composing contracts
 or off-chain UX.
 
+**Scheduled intents: native auth at schedule time, funds escrowed up front.**
+The sender authorizes the *scheduling* call (a normal Soroban
+`require_auth()`), and the contract commits the exact parameters into a SHA-256
+`params_hash` and pulls `(deposit + fee) × occurrences` immediately. Execution
+is then permissionless and needs no sender key: the keeper authorizes only its
+own call (which is what entitles it to the fee and prevents front-running).
+Escrowing up front is the load-bearing choice — it removes the "keeper executes
+an unfunded intent and wastes gas" failure mode entirely, at the cost of
+locking the sender's capital from scheduling until the last occurrence (or
+expiry). Recurring intents are modeled as N independent one-shot executions of
+a fixed-window recurrence, so catch-up and partial progress need no migration
+state. The full threat model (replay, front-running, under-funded-keeper
+griefing) is in [`SCHEDULED_INTENTS.md`](./SCHEDULED_INTENTS.md).
+
 ## 9. Testing strategy
 
 - **Unit tests** (`test.rs`) cover every spec edge case: withdraw before
@@ -222,6 +262,10 @@ or off-chain UX.
 - **`withdraw_max`** shares the `withdraw` payout tail (`pay_out`) so both
   paths inherit the same CEI ordering and reentrancy proof; index pagination
   and TTL behavior have dedicated tests in `test.rs`.
+- **Scheduled intents** (`schedule_test.rs`) cover the full lifecycle:
+  one-shot and recurring execution, double-execution rejection, the
+  cancel/execute race, expired-auth replay, permissionless reclaim, refund
+  accounting, and every validation/error path.
 
 ## 10. Open problems / roadmap hooks
 

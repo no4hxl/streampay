@@ -70,6 +70,12 @@ Deep dive (storage model, checked math, reentrancy, TTL strategy, design decisio
 | `available(stream_id) → i128` | — (read-only) | — | — |
 | `recipient_streams(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
 | `sender_streams(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
+| `schedule_stream(sender, recipient, token, deposit, start, end, cancelable, interval, occurrences, fee_budget, execute_after, expires_at) → u64` | anyone (sender auth required) | pulls `(deposit+fee)×occurrences` in | `StreamScheduled` |
+| `execute_scheduled(intent_id, keeper) → u64` | anyone (keeper auth required) | pays keeper the fee | `StreamCreated`, `ScheduledStreamExecuted` |
+| `cancel_scheduled(sender, intent_id)` | intent sender, before the window | refunds outstanding escrow | `ScheduledIntentCancelled` |
+| `reclaim_expired(intent_id)` | anyone, after `expires_at` | refunds outstanding escrow to sender | `ScheduledIntentExpired` |
+| `get_intent(intent_id) → ScheduledIntent` | — (read-only) | — | — |
+| `sender_intents(address, offset, limit) → Vec<u64>` | — (read-only) | — | — |
 
 `recipient_streams` / `sender_streams` are on-chain discovery indexes:
 append-only, creation-ordered stream-id lists per address, paginated
@@ -77,6 +83,27 @@ append-only, creation-ordered stream-id lists per address, paginated
 read each stream's `status` for lifecycle state.
 
 Creating a stream requires a prior token approval: `token.approve(sender, <contract id>, deposit, exp)`. All failures return typed `StreamError` codes (no panics) — see `contracts/streaming-payments/src/errors.rs`.
+
+### Scheduled intents (keeper-executable cron)
+
+`sender` can pre-authorize one or many future stream creations and escrow the
+up-front cost; a permissionless keeper then materializes each occurrence and
+collects the escrowed `fee_budget`. This gives payroll/vesting an on-chain cron
+without a sender signing key online. Funds are escrowed for **all** occurrences
+at scheduling time, so a keeper can never run an unfunded intent. New `StreamError`
+codes 14–21 cover the intent lifecycle.
+
+**Keeper in one command:** [`./scripts/keeper.sh`](./scripts/keeper.sh)
+
+```bash
+CONTRACT_ID=C... KEEPER=my-keeper ONCE=1 INTENTS="1 2 3" ./scripts/keeper.sh
+CONTRACT_ID=C... KEEPER=my-keeper SENDER=G... MIN_FEE=1000000 RECLAIM=1 \
+  ./scripts/keeper.sh
+```
+
+The full threat model (replay, keeper front-running, under-funded-keeper
+griefing, liveness) and the testnet run log live in
+[`docs/SCHEDULED_INTENTS.md`](./docs/SCHEDULED_INTENTS.md).
 
 ## Getting started (clean machine)
 
@@ -128,11 +155,13 @@ stellar contract deploy \
 ## Repo layout
 
 ```text
-contracts/streaming-payments/   the contract (lib.rs, stream.rs, errors.rs, events.rs, test.rs)
+contracts/streaming-payments/   the contract (lib.rs, stream.rs, schedule.rs, errors.rs, events.rs, test.rs, schedule_test.rs)
 frontend/                       minimal Next.js UI (Freighter wallet)
 fuzz/                           cargo-fuzz harness for the accrual math (own workspace)
 scripts/deploy_testnet.sh       one-command testnet demo
+scripts/keeper.sh               reference keeper for scheduled intents
 docs/ARCHITECTURE.md            design deep-dive
+docs/SCHEDULED_INTENTS.md       scheduled intents: keeper guide + threat model
 docs/DEMO.md                    verified testnet walkthrough
 docs/GOOD_FIRST_ISSUES.md       ready-to-file contributor tickets
 .github/workflows/ci.yml        test + fmt + clippy + coverage + wasm + lint/build/audit + supply chain
@@ -149,7 +178,9 @@ CHANGELOG.md                    release history (Keep a Changelog)
   event indexer service, `pause_stream` (good first issue)
 - **v0.3** — ✅ fuzzing in CI (`cargo-fuzz` on the rate math, scheduled),
   multi-token batch stream creation
-- **v0.4** — full web UI polish (accrual charts), ✅ testnet demo script
+- **v0.4** — full web UI polish (accrual charts), ✅ testnet demo script,
+  ✅ keeper-executable scheduled intents (`schedule_stream` /
+  `execute_scheduled`, `scripts/keeper.sh`)
 - **v1.0** — external audit, mainnet deployment guide
 
 Feature requests live in [`.github/ISSUE_TEMPLATE/`](./.github/ISSUE_TEMPLATE/) — good first issues are tagged [`good first issue`](https://github.com/Neziahtech/streampay/labels/good%20first%20issue) and documented in [`docs/GOOD_FIRST_ISSUES.md`](./docs/GOOD_FIRST_ISSUES.md).

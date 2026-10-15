@@ -41,4 +41,27 @@ pub enum StreamError {
     NotAuthorized = 12,
     /// `withdraw_max` found nothing accrued-but-unwithdrawn to pay out.
     NothingToWithdraw = 13,
+    /// No scheduled intent exists with the provided id.
+    IntentNotFound = 14,
+    /// The scheduled intent is not pending (already executed, cancelled, or
+    /// expired), so the operation is not permitted.
+    IntentNotPending = 15,
+    /// Execution was attempted before the intent's `execute_after` (for the
+    /// next outstanding occurrence).
+    IntentNotYetExecutable = 16,
+    /// Execution or cancellation was attempted at/after the intent's
+    /// `expires_at`; the funds are reclaimable via `reclaim_expired`.
+    IntentExpired = 17,
+    /// The sender tried to cancel an intent whose execution window has already
+    /// opened; cancellation is only allowed before `execute_after`.
+    IntentNotCancellable = 18,
+    /// The scheduling parameters are inconsistent (bad occurrence/interval
+    /// combination, negative fee budget, ordering of `execute_after` /
+    /// `start_time` / `expires_at`, or an overflowing recurrence window).
+    InvalidScheduleParameters = 19,
+    /// A defensive integrity check failed: the stored intent's parameters no
+    /// longer hash to the commitment recorded when it was scheduled.
+    IntentParamsMismatch = 20,
+    /// `reclaim_expired` was called before the intent's `expires_at`.
+    IntentNotExpired = 21,
 }
